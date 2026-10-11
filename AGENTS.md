@@ -11,7 +11,7 @@ Use out-of-source builds:
 Platform helpers such as `build_linux.sh`, `build_release_macos.sh`, and `build_release_vs2022.bat` wrap the same flow with toolchain flags. Use `build_release_macos.sh -sx` when reproducing macOS build issues, and `scripts/DockerBuild.sh` for reproducible container builds.
 
 ### Ubuntu 26.04 fork (branch `ubuntu-26.04`) — host rules
-- Never start Snapmaker Orca (AppImage or binary, GUI or CLI) directly on the development laptop: USB/HID enumeration there has hung the machine. Run it only in containers without device access (`scripts/ubuntu2604/gui-test/update-test.sh`, the smoke slice in `scripts/fork-sync/release.sh`).
+- Never start Snapmaker Orca (AppImage or binary, GUI or CLI) directly on the development laptop: USB/HID enumeration there has hung the machine. Run it only in containers without device access (`scripts/ubuntu2604/gui-test/update-test.sh`, the smoke slice in `scripts/fork-sync/release.sh`) or on a Runpod pod (`scripts/ubuntu2604/gui-test/remote-test.sh`); never with `SO_DIRECT=1` on the laptop.
 - No heavy work on the laptop: no local compiles, full test-suite runs or stress loops. Build and test on Runpod with `scripts/ubuntu2604/remote-build.sh` (`REMOTE_EXTRA_CMD` repeats a flaky test there); `release.sh` uses it by default. See `doc/developer-reference/How-to-build.md`, section "Ubuntu 26.04".
 
 ## Coding Style & Naming Conventions
