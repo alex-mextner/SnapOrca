@@ -6,7 +6,9 @@
 # `sh -c 'while kill -0 PID; ...; exec APPIMAGE ARGS'` and is orphaned when the first instance
 # exits; as child subreaper this process inherits it, so its real exit status can be reaped here.
 # Events (one per line): first_pid=, first_exit=RC, relaunch_pid=, relaunch_cmd=ARGV,
-# relaunch_exit=RC, done. RC is the exit code, or -SIGNAL when killed by a signal.
+# relaunch_exit=RC, done. RC is the exit code, or -SIGNAL when killed by a signal. With
+# APPIMAGE_EXTRACT_AND_RUN the AppImage runtime forks the app and exits 127 when the app itself
+# was killed by a signal (a crash), so first_exit=127 means a crash, not a missing command.
 # Usage: app-runner.py APPIMAGE DATADIR EVENTS [APP_ARG...]; APP_ARGs (e.g. a project file) follow --datadir.
 import ctypes
 import os

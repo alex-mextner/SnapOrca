@@ -7,6 +7,11 @@
 # wait_gone, wait_line, click_button, close_window, close_wizard, close_main.
 
 export DISPLAY=:99 HOME=$W/home APPIMAGE_EXTRACT_AND_RUN=1 NO_AT_BRIDGE=1
+# The fork's AppRun points the statically linked OpenSSL at the system CA bundle; an AppImage
+# without that (Snapmaker main) otherwise stops at a "use system SSL certificate" dialog on start.
+if [ -z "${SSL_CERT_FILE:-}" ] && [ -r /etc/ssl/certs/ca-certificates.crt ]; then
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+fi
 RUNNER=''
 
 log() { echo "$(date +%T) $*" | tee -a "$W/driver.log"; }
