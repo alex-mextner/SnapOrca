@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# Runs INSIDE the GUI test container (started by driver.sh), never on the host.
+# Runs INSIDE the GUI test container (started by driver.sh / fix-model-driver.sh) or on the
+# throwaway machine of SO_DIRECT=1, never on the laptop.
 # Starts the AppImage and records, in an events file, the exit status of that first instance and
 # of the instance the updater relaunches. The relaunch is spawned by the app as
 # `sh -c 'while kill -0 PID; ...; exec APPIMAGE ARGS'` and is orphaned when the first instance
 # exits; as child subreaper this process inherits it, so its real exit status can be reaped here.
 # Events (one per line): first_pid=, first_exit=RC, relaunch_pid=, relaunch_cmd=ARGV,
 # relaunch_exit=RC, done. RC is the exit code, or -SIGNAL when killed by a signal.
+# Usage: app-runner.py APPIMAGE DATADIR EVENTS [APP_ARG...]; APP_ARGs (e.g. a project file) follow --datadir.
 import ctypes
 import os
 import sys
@@ -24,6 +26,7 @@ def cmdline(pid):
 
 def main():
     appimage, datadir, events_path = sys.argv[1:4]
+    app_args = sys.argv[4:]
 
     def event(msg):
         with open(events_path, "a") as f:
@@ -32,7 +35,7 @@ def main():
     if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         sys.exit(f"prctl(PR_SET_CHILD_SUBREAPER) failed: errno {ctypes.get_errno()}")
 
-    first = os.posix_spawn(appimage, [appimage, "--datadir", datadir], os.environ)
+    first = os.posix_spawn(appimage, [appimage, "--datadir", datadir, *app_args], os.environ)
     event(f"first_pid={first}")
     relaunch, relaunch_cmd, first_done = None, None, False
     while True:

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end GUI test of the AppImage self-update flow, fully headless and inside docker.
+# End-to-end GUI test of the AppImage self-update flow, fully headless and inside docker, or with
+# SO_DIRECT=1 on a throwaway machine's own Xvfb (remote-test.sh runs it so on a Runpod pod).
 # Usage: scripts/ubuntu2604/gui-test/update-test.sh [normal|force] [AppImage]
 #   normal: optional update; answers "Restart now?" with Yes and expects a relaunch with --datadir.
 #   force:  forced update; answers No and expects the app to close without relaunch.
@@ -11,39 +12,39 @@
 # Env: SO_OUT=DIR results root (default ${TMPDIR:-/tmp}/snap-orca-gui-test)
 #      SO_RO=1 read-only app dir: control run, Download must fall back to the browser
 #      SO_VERSION=X.Y.Z manifest version when the AppImage name has no _V<version>
+#      SO_DIRECT=1 no docker: run the driver on this machine (only a throwaway test machine, see host-lib.sh)
 # Exit status: 0 all checks passed, 1 a check failed, 2 usage/setup error.
 set -euo pipefail
 
 HERE=$(dirname "$(readlink -f "$0")")
 ROOT=$(readlink -f "${HERE}/../../..")
-IMAGE=snap-orca-guitest:26.04
-BASE_IMAGE=snap-orca-build:26.04
+# shellcheck source=host-lib.sh
+. "${HERE}/host-lib.sh"
+export SO_RO=${SO_RO:-0}
+# shellcheck disable=SC2034 # read by run_driver
+DRIVER_ENV=SO_RO
 
 VARIANT=${1:-normal}
 case "${VARIANT}" in
     normal | force) ;;
     *) sed -n '2,14p' "$0" >&2; exit 2 ;;
 esac
+# shellcheck disable=SC2012 # newest by mtime; build file names have no special characters
 SRC=${2:-$(ls -t "${ROOT}"/build/Snapmaker_Orca_Linux_V*.AppImage 2>/dev/null | head -n1 || true)}
 [[ -f "${SRC}" ]] || { echo "AppImage not found: ${SRC:-${ROOT}/build/Snapmaker_Orca_Linux_V*.AppImage}" >&2; exit 2; }
 VERSION=${SO_VERSION:-$(basename "${SRC}" | sed -nE 's/.*_V([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')}
 [[ -n "${VERSION}" ]] || { echo "cannot derive the version from ${SRC}; set SO_VERSION" >&2; exit 2; }
 
-if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-    docker image inspect "${BASE_IMAGE}" >/dev/null 2>&1 || docker build -t "${BASE_IMAGE}" "${HERE}/.."
-    docker build -t "${IMAGE}" --build-arg BASE_IMAGE="${BASE_IMAGE}" "${HERE}"
-fi
-
 OUT=${SO_OUT:-${TMPDIR:-/tmp}/snap-orca-gui-test}/${VARIANT}$([[ "${SO_RO:-0}" = 1 ]] && echo -ro)-$(date +%Y%m%d-%H%M%S)
 mkdir -p "${OUT}"/{app,srv,data,shots}
 OUT=$(readlink -f "${OUT}")
+prepare_driver "${OUT}"
 APP=${OUT}/app/$(basename "${SRC}")
 PORT=18765 # must match driver.sh
-CONTAINER=snap-orca-guitest-$$
 
 # Results keep sha.txt instead of the two 100+ MB AppImages.
 cleanup() {
-    docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+    stop_driver
     chmod 755 "${OUT}/app"
     rm -f "${APP}" "${OUT}/srv/new.AppImage"
 }
@@ -73,9 +74,7 @@ EOF
 
 echo "results: ${OUT}"
 set +e
-docker run --rm --name "${CONTAINER}" --network none --shm-size 512m --user "$(id -u):$(id -g)" \
-    -e SO_RO="${SO_RO:-0}" -v "${OUT}:/work" -v "${HERE}:/harness:ro" \
-    "${IMAGE}" bash /harness/driver.sh "${VARIANT}"
+run_driver "${OUT}" driver.sh "${VARIANT}"
 FLOW_RC=$?
 set -e
 FINAL_SHA=$(sha256sum "${APP}" | cut -c1-64)
@@ -106,7 +105,7 @@ check "first instance exit code 0" "exit=${FIRST_EXIT:-none}" test "${FIRST_EXIT
 RELAUNCH=$(event relaunch_cmd)
 if [[ "${VARIANT}" = normal && "${SO_RO:-0}" != 1 ]]; then
     RELAUNCH_EXIT=$(event relaunch_exit)
-    check "relaunched instance has --datadir" "${RELAUNCH:-no relaunch}" grep -q -- '--datadir /work/data' <<<"${RELAUNCH}"
+    check "relaunched instance has --datadir" "${RELAUNCH:-no relaunch}" grep -q -- "--datadir ${DRIVER_WORK}/data" <<<"${RELAUNCH}"
     check "relaunched instance exit code 0" "exit=${RELAUNCH_EXIT:-none}" test "${RELAUNCH_EXIT}" = 0
 else
     check "no relaunch" "${RELAUNCH:-none}" test -z "$(event relaunch_pid)"
