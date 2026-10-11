@@ -6,8 +6,18 @@
 # --merge   first merge the given Snapmaker/OrcaSlicer release tag into the release branch
 # --dry-run build, test and assemble dist/ but do not commit the build bump, push or publish
 #
-# Exit codes: 10 merge conflict (resolve, commit, rerun without --merge), 11 build failed,
-# 12 tests failed, 13 smoke test failed, other non-zero: usage / environment errors.
+# Exit codes: 10 merge conflict (resolve on branch fork-sync/<tag>, review, commit, switch back
+# and rerun with the same --merge), 11 build failed, 12 tests failed, 13 smoke test failed,
+# other non-zero: usage / environment errors.
+#
+# The upstream tag is merged on the side branch fork-sync/<tag>, which starts at the tag and
+# merges the release branch into it; the release branch then fast-forwards to that merge. With
+# upstream as the first parent, the merge's own diff (`git diff --cached` while conflicts are
+# resolved, which the host's review-before-commit hook requires `review diff --staged` to have
+# passed on) is the fork's delta re-applied to the new release, a few hundred KB the reviewers
+# can read. Merged the other way round it would be the whole upstream release (10-30 MB per
+# Snapmaker release), which review-cli truncates and therefore never stamps, so a conflicted
+# merge could not be committed. A merge without conflicts runs no pre-commit hook.
 #
 # BUILD_BACKEND=runpod (default when a Runpod API key is configured) builds and tests on a
 # temporary Runpod CPU pod (scripts/ubuntu2604/remote-build.sh, ~$1/h, deleted afterwards);
@@ -56,12 +66,37 @@ flock -n 8 || die "another release.sh is running"
 [[ $(git rev-parse --abbrev-ref HEAD) == "$BRANCH" ]] || die "not on $BRANCH"
 { git diff --quiet && git diff --cached --quiet; } || die "working tree has uncommitted changes"
 
+# Merge upstream release $1 as described in the header. A rerun after the conflicts were
+# resolved and committed on the side branch takes that finished merge, but only if it is exactly
+# the merge of the tag (first parent) and the current release branch (second parent).
+merge_upstream() {
+    local tag=$1 side=fork-sync/$1 tip
+    if tip=$(git rev-parse -q --verify "refs/heads/$side"); then
+        [[ $(git rev-parse "$tip^@") == "$(git rev-parse "$tag^{commit}" HEAD)" ]] ||
+            die "branch $side is not exactly a merge of $tag (first parent) and the current $BRANCH (second parent): commits made on $BRANCH or $side after the merge belong on $BRANCH only after this rerun fast-forwarded it; move them aside, or redo the merge (git branch -D $side), then rerun"
+    else
+        echo "== merging $tag"
+        git switch -q -c "$side" "$tag^{commit}"
+        git merge --no-edit -m "Merge Snapmaker $tag into $BRANCH" "$BRANCH" ||
+            die "merge of $tag has conflicts, left on branch $side (ours = upstream $tag, theirs = $BRANCH): resolve them, review the staged merge (REVIEW_DIFF_MAX_BYTES=1000000 review diff --staged), commit, switch to $BRANCH and rerun with --merge $tag" 10
+        git switch -q "$BRANCH"
+    fi
+    git merge -q --ff-only "$side"
+    git branch -q -d "$side"
+}
+
 if [[ -n "$MERGE_TAG" ]]; then
     git fetch --no-tags "$UPSTREAM_URL" "+refs/tags/$MERGE_TAG:refs/tags/$MERGE_TAG"
     if ! git merge-base --is-ancestor "$MERGE_TAG" HEAD; then
-        echo "== merging $MERGE_TAG"
-        git merge --no-edit -m "Merge Snapmaker $MERGE_TAG" "$MERGE_TAG" || die "merge of $MERGE_TAG has conflicts" 10
+        merge_upstream "$MERGE_TAG"
     fi
+else
+    # Without --merge a resolved merge would stay on its side branch and the release would ship
+    # the fork without it. merge_upstream deletes the side branch once the merge is in $BRANCH.
+    for side in $(git for-each-ref --format='%(refname:lstrip=2)' refs/heads/fork-sync/); do
+        git merge-base --is-ancestor "refs/heads/$side" HEAD ||
+            die "unfinished upstream merge on branch $side; rerun with --merge ${side#fork-sync/}, or delete the branch if that merge is abandoned"
+    done
 fi
 
 version=$(sed -nE 's/^set\(Snapmaker_VERSION "([^"]+)"\).*/\1/p' version.inc)
