@@ -271,6 +271,16 @@ Linux builds check `ORCA_LINUX_UPDATE_URL` (`version.inc`; default: the fork's `
 
 `scripts/fork-sync/install.sh` installs a systemd user timer (every 3 hours) that runs `check-upstream.sh`. When Snapmaker publishes a new stable release, the timer starts a headless `omp` session (`scripts/fork-sync/omp-prompt.md`). That session merges the tag, fixes conflicts and build/test failures, and publishes through `release.sh`. Logs go to `~/.local/state/snap-orca-sync/logs`, and a desktop notification reports the result. A failed tag is not retried until `check-upstream.sh --force <tag>`. No human reviews the merge before clients are offered it: the only gates are the build, the test suite and the smoke slice. Read the log after each notification; `gh release delete <tag>` withdraws a bad release (the manifest URL then resolves to the previous release, but clients that already updated keep the bad build until the next release).
 
+#### Fix model
+
+Fix model (right-click an object in the object list → "Fix model") is available in Linux builds of this fork. It is the CGAL repair of [OrcaSlicer#12155](https://github.com/OrcaSlicer/OrcaSlicer/pull/12155), ported by ealap and built here against Ubuntu's CGAL. It runs on a copy of the object off the GUI thread, so the window stays responsive and Cancel leaves the object unchanged. Volumes that are already closed and consistently oriented are left untouched. Broken ones get duplicate vertices merged, degenerate faces removed, holes filled, faces reoriented, and nested shells kept as booleans by nesting level (a cavity stays a cavity).
+
+Paint (color, supports, seams, fuzzy skin) on a repaired volume is lost, because its triangles change; untouched volumes keep it. Self-intersections cannot be removed without changing the shape, so Fix model reports them as a warning instead.
+
+#### STEP surface models
+
+STEP bodies made of loose faces or open shells (surface models) are sewn on import. Where the sewn faces close into a shell, the body arrives as a closed solid without open edges; faces that cannot be closed (for example a box missing its top) are imported unchanged, open edges included. Upstream drafts: [Snapmaker#988](https://github.com/Snapmaker/OrcaSlicer/pull/988), [OrcaSlicer#16347](https://github.com/OrcaSlicer/OrcaSlicer/pull/16347).
+
 #### LAN printer auto-connect
 
 After a printer has been connected once from the Device page, later starts reconnect to it in the background without switching to the Device tab. The printer re-issues TLS credentials for the stored client id (`server.client_manager.confirm_lan_status`), so no confirmation is needed on its screen. That reply arrives over plain MQTT, so it is accepted only for the stored serial number and client id, and only with the CA certificate seen on the previous connection (`last_connected_ca_sha256`, trust on first use). If the printer no longer authorizes the client or presents another CA, the app stays disconnected; add the printer again on the Device page. Opt out with Preferences → Presets → "Reconnect to the last LAN printer on startup" (`auto_connect_last_printer`).
