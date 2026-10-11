@@ -27,7 +27,7 @@ endif()
 # Linux fork releases (see scripts/fork-sync). ORCA_FORK_BUILD increases with every fork release
 # of the same Snapmaker_VERSION; the Linux updater offers a release when its Snapmaker version is
 # newer, or equal with a higher fork build.
-set(ORCA_FORK_BUILD "1")
+set(ORCA_FORK_BUILD "2")
 if (NOT DEFINED ORCA_LINUX_UPDATE_URL)
     set(ORCA_LINUX_UPDATE_URL "https://github.com/alex-mextner/SnapOrca/releases/latest/download/version.json"
         CACHE STRING "Update manifest checked by Linux builds")
