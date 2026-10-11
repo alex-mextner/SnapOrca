@@ -15,7 +15,11 @@
 # run does, plus remote-<time>.log with the console of every test, the pod, its price and run time.
 # Needs a Runpod API key (RUNPOD_API_KEY, or ~/.runpod/config.toml from `runpodctl doctor`) and an
 # SSH key (SSH_KEY, default ~/.ssh/id_ed25519).
-# Env: RUNPOD_CPU_FLAVORS (default cpu5c,cpu3c), RUNPOD_VCPU (default 8), RUNPOD_MAX_HOURS (default 2).
+# Env: RUNPOD_CPU_FLAVORS (default cpu5c,cpu3c), RUNPOD_VCPU (default 8), RUNPOD_MAX_HOURS (default 2),
+# RUNPOD_POD_DCS (data centers, tried in order; default below), RUNPOD_START_MINUTES
+# (default 4): Runpod sometimes schedules a pod that never starts (no runtime, no SSH port) while
+# reporting the data center's stock as high; such a pod is deleted after that long and replaced
+# once in the data centers of RUNPOD_POD_DCS after the one that failed.
 # Exit status: 0 every test passed, 1 a test failed, 2 usage error, other: pod / transfer errors.
 set -euo pipefail
 
@@ -23,6 +27,11 @@ HERE=$(dirname "$(readlink -f "$0")")
 FLAVORS=${RUNPOD_CPU_FLAVORS:-cpu5c,cpu3c} # compute-optimized, 2 GB RAM per vCPU
 VCPU=${RUNPOD_VCPU:-8}
 MAX_HOURS=${RUNPOD_MAX_HOURS:-2}
+# Secure-cloud data centers with cpu5c (the first two) or cpu3c, Europe first.
+POD_DCS=${RUNPOD_POD_DCS:-EUR-IS-1,EU-RO-1,EU-NL-1,EU-CZ-1,EU-SE-1,US-IL-1,US-KS-2,US-GA-2,US-WA-1,US-CA-2}
+POD_DCS=${POD_DCS//[[:space:]]/}
+START_MINUTES=${RUNPOD_START_MINUTES:-4}
+[[ $START_MINUTES =~ ^[1-9][0-9]*$ ]] || { echo "remote-test.sh: RUNPOD_START_MINUTES must be a positive integer" >&2; exit 2; }
 SSH_KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519}
 OUT=${SO_OUT:-${TMPDIR:-/tmp}/snap-orca-gui-test}
 API=https://rest.runpod.io/v1
@@ -81,6 +90,8 @@ api_key=${RUNPOD_API_KEY:-$(sed -nE 's/^apikey *= *"(.*)"/\1/p' "$HOME/.runpod/c
 [[ -r $SSH_KEY.pub ]] || die "missing $SSH_KEY.pub"
 # Key passed through a curl config on stdin, not argv (visible in ps).
 api() { printf 'header = "Authorization: Bearer %s"\n' "$api_key" | curl -fsS -m 60 -K - -H 'Content-Type: application/json' "$@"; }
+# api_status URL: the HTTP status of a GET, 000 when there was no response.
+api_status() { printf 'header = "Authorization: Bearer %s"\n' "$api_key" | curl -sS -m 60 -K - -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || true; }
 # field KEY [SUBKEY]: value from the JSON object on stdin, empty when missing or not JSON.
 field() {
     python3 -c 'import json, sys
@@ -115,14 +126,16 @@ cleanup() {
         pod_id=""
         fetch_results
         step "deleting pod $id"
-        if api -X DELETE "$API/pods/$id" >/dev/null; then
+        if delete_pod "$id"; then
             local secs=$((SECONDS - pod_start))
             step "pod $id deleted after $((secs / 60))m$((secs % 60))s (\$${cost:-?}/h: about \$$(python3 -c "print(f'{${cost:-0} * $secs / 3600:.3f}')"))"
-        else
+            [[ -z $watchdog_pid ]] || kill -- "-$watchdog_pid" 2>/dev/null || true # its session: bash + sleep
+        else # the detached deleter stays as the last backstop
             echo "remote-test.sh: could not delete pod $id, delete it in the Runpod console" | tee -a "$LOG" >&2
         fi
+    elif [[ -n $watchdog_pid ]]; then
+        kill -- "-$watchdog_pid" 2>/dev/null || true
     fi
-    [[ -z $watchdog_pid ]] || kill -- "-$watchdog_pid" 2>/dev/null || true # its session: bash + sleep
     rm -rf "$tmp"
     exit "$rc"
 }
@@ -147,50 +160,106 @@ ssh-keygen -A
 exec /usr/sbin/sshd -D -e
 EOF
 )
-pod_request() { # pod_request FLAVOR: the create body
-    python3 - "$1" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" <<'EOF'
+pod_request() { # pod_request FLAVOR DCS: the create body
+    python3 - "$1" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" "$2" <<'EOF'
 import json, sys
-flavor, vcpu, max_seconds, pubkey, boot = sys.argv[1:]
+flavor, vcpu, max_seconds, pubkey, boot, dcs = sys.argv[1:]
 print(json.dumps({
     "name": "snap-orca-gui-test", "computeType": "CPU", "cloudType": "SECURE",
     "cpuFlavorIds": [flavor], "vcpuCount": int(vcpu),
     "imageName": "ubuntu:26.04", "containerDiskInGb": 30, "ports": ["22/tcp"],
     "env": {"GUI_SSH_KEY": pubkey, "GUI_MAX_SECONDS": max_seconds},
     "dockerStartCmd": ["bash", "-c", boot],
+    # Without a list Runpod's default puts EU-RO-1 first; "custom" keeps the given order.
+    "dataCenterIds": dcs.split(","), "dataCenterPriority": "custom",
 }))
 EOF
+}
+# delete_pod ID: deletes the pod and waits up to a minute until the API no longer knows it (404).
+delete_pod() {
+    local code
+    api -X DELETE "$API/pods/$1" >/dev/null || true
+    for _ in $(seq 12); do
+        code=$(api_status "$API/pods/$1")
+        [[ $code == 404 ]] && return 0
+        sleep 5
+    done
+    echo "remote-test.sh: pod $1 still exists after deletion (HTTP $code)" >>"$LOG"
+    return 1
+}
+# start_pod DCS: creates a pod (pod_id, pod_dc, cost, pod_start) and a backstop deleter for it, then
+# waits up to START_MINUTES for its public SSH port (ip, port). Returns 0 with the port, 2 when no
+# flavor could be created (no pod), 1 when the pod got no SSH port (left for the caller to delete).
+start_pod() {
+    local flavor
+    pod=""
+    for flavor in ${FLAVORS//,/ }; do # one at a time, in order: with several, Runpod picks by availability
+        pod=$(api -X POST "$API/pods" -d "$(pod_request "$flavor" "$1")" 2>"$tmp/create.err") && break
+        pod=""
+    done
+    [[ -n $pod ]] || return 2
+    pod_id=$(field id <<<"$pod")
+    pod_start=$SECONDS
+    cost=$(field costPerHr <<<"$pod")
+    # Backstop if this script dies without its EXIT trap (kill -9, crash): a detached deleter, with
+    # the key in its environment rather than argv.
+    [[ -z $watchdog_pid ]] || kill -- "-$watchdog_pid" 2>/dev/null || true
+    # shellcheck disable=SC2016 # $RP_KEY/$RP_POD expand in the detached shell, not here
+    RP_KEY=$api_key RP_POD=$pod_id setsid bash -c "sleep $((MAX_HOURS * 3600)); "'printf "header = \"Authorization: Bearer %s\"\n" "$RP_KEY" | curl -fsS -m 60 -K - -X DELETE "'"$API"'/pods/$RP_POD"' \
+        </dev/null >/dev/null 2>&1 &
+    watchdog_pid=$!
+    ip="" port="" pod_dc=""
+    first_dc=${1%%,*} # where a pod that never gets a machine was meant to go
+    local deadline=$((SECONDS + START_MINUTES * 60)) reported=""
+    while ((SECONDS < deadline)); do
+        pod=$(api "$API/pods/$pod_id?includeMachine=true" || true)
+        pod_dc=${pod_dc:-$(field machine dataCenterId <<<"$pod")}
+        if [[ -z $reported && -n $pod_dc ]]; then
+            step "pod $pod_id in $pod_dc: $(field cpuFlavorId <<<"$pod") $(field vcpuCount <<<"$pod") vCPU $(field memoryInGb <<<"$pod") GB, \$$cost/h"
+            reported=1
+        fi
+        ip=$(field publicIp <<<"$pod")
+        port=$(field portMappings 22 <<<"$pod")
+        [[ -n $ip && -n $port ]] && return 0
+        ip=""
+        sleep 5
+    done
+    return 1
+}
+# next_dcs DC: POD_DCS starting after DC, without it (all of POD_DCS when DC is not in it).
+next_dcs() {
+    local -a dcs=() after=() before=()
+    local dc seen=""
+    IFS=, read -ra dcs <<<"$POD_DCS"
+    for dc in "${dcs[@]}"; do
+        if [[ $dc == "$1" ]]; then seen=1
+        elif [[ -n $seen ]]; then after+=("$dc")
+        else before+=("$dc"); fi
+    done
+    dcs=("${after[@]}" "${before[@]}")
+    (IFS=,; echo "${dcs[*]}")
 }
 
 step "${#tests[@]} test(s), ${#uploads[@]} file(s) to upload; results in $OUT"
 for t in "${tests[@]}"; do echo "   $t" | tee -a "$LOG"; done
-step "creating pod ($VCPU vCPU, $FLAVORS)"
-pod=""
-for flavor in ${FLAVORS//,/ }; do # one at a time, in order: with several, Runpod picks by availability
-    pod=$(api -X POST "$API/pods" -d "$(pod_request "$flavor")" 2>"$tmp/create.err") && break
-    pod=""
-done
-[[ -n $pod ]] || die "pod creation failed: $(cat "$tmp/create.err")"
-pod_id=$(field id <<<"$pod")
-pod_start=$SECONDS
-cost=$(field costPerHr <<<"$pod")
-step "pod $pod_id: $(field cpuFlavorId <<<"$pod") $(field vcpuCount <<<"$pod") vCPU $(field memoryInGb <<<"$pod") GB, \$$cost/h"
-# Backstop if this script dies without its EXIT trap (kill -9, crash): a detached deleter, with the
-# key in its environment rather than argv.
-# shellcheck disable=SC2016 # $RP_KEY/$RP_POD expand in the detached shell, not here
-RP_KEY=$api_key RP_POD=$pod_id setsid bash -c "sleep $((MAX_HOURS * 3600)); "'printf "header = \"Authorization: Bearer %s\"\n" "$RP_KEY" | curl -fsS -m 60 -K - -X DELETE "'"$API"'/pods/$RP_POD"' \
-    </dev/null >/dev/null 2>&1 &
-watchdog_pid=$!
-
-port=""
-for _ in $(seq 120); do
-    pod=$(api "$API/pods/$pod_id" || true)
-    ip=$(field publicIp <<<"$pod")
-    port=$(field portMappings 22 <<<"$pod")
-    [[ -n $ip && -n $port ]] && break
-    ip=""
-    sleep 5
-done
-[[ -n $ip ]] || die "pod $pod_id got no public SSH port"
+step "creating pod ($VCPU vCPU, $FLAVORS, in $POD_DCS)"
+rc=0
+start_pod "$POD_DCS" || rc=$?
+((rc != 2)) || die "pod creation failed: $(cat "$tmp/create.err")"
+if ((rc == 1)); then
+    stuck_dc=${pod_dc:-$first_dc}
+    retry_dcs=$(next_dcs "$stuck_dc")
+    retry_dcs=${retry_dcs:-$POD_DCS} # RUNPOD_POD_DCS was only the failed data center
+    echo "remote-test.sh: warning: pod $pod_id in $stuck_dc got no SSH port in $START_MINUTES min, deleting it and retrying in $retry_dcs" | tee -a "$LOG" >&2
+    stuck_id=$pod_id
+    delete_pod "$stuck_id" || die "could not delete the stuck pod $stuck_id" # cleanup tries again
+    pod_id=""
+    step "pod $stuck_id deleted"
+    rc=0
+    start_pod "$retry_dcs" || rc=$?
+    ((rc != 2)) || die "pod creation failed: $(cat "$tmp/create.err")"
+    ((rc == 0)) || die "pod $pod_id${pod_dc:+ in $pod_dc} got no SSH port in $START_MINUTES min either"
+fi
 ssh_opts=(-i "$SSH_KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30
           -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$tmp/known_hosts")
 # shellcheck disable=SC2029 # commands are built locally on purpose
