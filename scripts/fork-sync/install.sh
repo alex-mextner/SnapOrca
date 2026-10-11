@@ -7,8 +7,9 @@ ROOT=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)
 UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 mkdir -p "$UNIT_DIR"
 
-# Release builds run on Runpod by default (scripts/ubuntu2604/remote-build.sh).
-for tool in omp gh docker git flock curl python3 rsync ssh; do
+# Release builds run on Runpod by default (scripts/ubuntu2604/remote-build.sh); review (review-cli)
+# reviews release.sh's build bump commit for this host's review-before-commit hook.
+for tool in omp gh docker git flock curl python3 rsync ssh review setsid; do
     command -v "$tool" >/dev/null || { echo "install.sh: $tool not found in PATH" >&2; exit 1; }
 done
 

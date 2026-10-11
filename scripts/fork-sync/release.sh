@@ -13,6 +13,12 @@
 # temporary Runpod CPU pod (scripts/ubuntu2604/remote-build.sh, ~$1/h, deleted afterwards);
 # BUILD_BACKEND=local builds in the local container and occupies all cores of this machine.
 #
+# The build bump commit goes through this host's review-before-commit git hook, which accepts
+# it only after `review diff --staged` passed on exactly that staged diff. release.sh stages
+# the bump and reviews it in the background while the build runs (log: release-review.log in
+# the git dir; task code $REVIEW_TASK_CODE, default fork-release-<tag>), then waits for it
+# before committing. A failed review stops the release before the commit.
+#
 # The release carries the AppImage and version.json, the manifest that Linux builds poll
 # (ORCA_LINUX_UPDATE_URL in version.inc points at releases/latest/download/version.json).
 set -euo pipefail
@@ -48,7 +54,7 @@ exec 8>"$(git rev-parse --git-dir)/fork-release.lock"
 flock -n 8 || die "another release.sh is running"
 
 [[ $(git rev-parse --abbrev-ref HEAD) == "$BRANCH" ]] || die "not on $BRANCH"
-git diff --quiet && git diff --cached --quiet || die "working tree has uncommitted changes"
+{ git diff --quiet && git diff --cached --quiet; } || die "working tree has uncommitted changes"
 
 if [[ -n "$MERGE_TAG" ]]; then
     git fetch --no-tags "$UPSTREAM_URL" "+refs/tags/$MERGE_TAG:refs/tags/$MERGE_TAG"
@@ -70,9 +76,49 @@ sed -i -E "s/^set\(ORCA_FORK_BUILD \"[0-9]+\"\)/set(ORCA_FORK_BUILD \"$build\")/
 grep -q "^set(ORCA_FORK_BUILD \"$build\")" version.inc || die "could not set ORCA_FORK_BUILD in version.inc"
 
 published=0
-# Leave the tree clean unless the build bump was committed.
-restore_version_inc() { if [[ $published == 0 ]]; then git checkout -q -- version.inc; fi; }
-trap restore_version_inc EXIT
+review_pid=""
+review_log="$(git rev-parse --absolute-git-dir)/release-review.log"
+# Leave the tree and index clean unless the build bump was committed; a review still running
+# for a release that failed is pointless, so stop it with its model CLIs (own process group).
+# Only a job bash still lists as running is killed: the pid of a finished one may be reused.
+cleanup() {
+    if [[ -n $review_pid ]] && grep -qx "$review_pid" <<<"$(jobs -pr)"; then
+        # Right after the launch setsid may not have created the group yet: kill the pid then.
+        kill -- "-$review_pid" 2>/dev/null || kill "$review_pid" 2>/dev/null || true
+    fi
+    if [[ $published == 0 ]]; then git checkout -q HEAD -- version.inc; fi
+}
+trap cleanup EXIT
+# bash skips the EXIT trap when a signal kills it; the detached review would survive that.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# setsid without --fork keeps $! (a background job of a script is no group leader) and makes
+# the review its own process group, which cleanup() kills as a whole. 8>&- keeps the release
+# lock from outliving release.sh in a straggling review process.
+start_bump_review() {
+    command -v review >/dev/null || die "review (review-cli) not on PATH; the commit hook requires it"
+    git add version.inc
+    setsid review diff --staged --preset light --no-tui --task "${REVIEW_TASK_CODE:-fork-release-$tag}" \
+        -C "$ROOT" </dev/null >"$review_log" 2>&1 8>&- &
+    review_pid=$!
+}
+
+commit_bump() {
+    if [[ -n $review_pid ]]; then
+        echo "== waiting for the review of the build bump ($review_log)"
+        wait "$review_pid" || die "review of the build bump failed (exit $?), see $review_log"
+        review_pid=""
+    fi
+    # The build read the working tree, the review saw the index: they must still agree.
+    git diff --quiet -- version.inc || die "version.inc changed during the build; not committing it"
+    git commit -q -m "release: $tag" -- version.inc || die "commit of the build bump rejected, see $review_log"
+}
+
+if [[ $DRY_RUN == 0 ]] && ! git diff --quiet -- version.inc; then
+    start_bump_review
+fi
 
 appimage="build/Snapmaker_Orca_Linux_V$version.AppImage"
 rm -f "$appimage"
@@ -157,8 +203,9 @@ echo "== publish $tag"
 # Resumable: the tag is created by GitHub together with the release, so a run that failed before
 # that point (push or release creation) is completed by rerunning, which then computes the same
 # build number.
-if ! git diff --quiet -- version.inc; then
-    git commit -q -m "release: $tag" version.inc
+# Against HEAD, not the index: an index reset during the build must fail in commit_bump.
+if ! git diff --quiet HEAD -- version.inc; then
+    commit_bump
 fi
 published=1
 git push -q "$FORK_REMOTE" "$BRANCH"

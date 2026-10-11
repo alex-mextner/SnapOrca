@@ -34,6 +34,10 @@ Steps:
 6. Never run heavy work on this laptop: no local builds (`BUILD_BACKEND=local`, `scripts/ubuntu2604/build.sh`,
    `cmake --build`), no full test-suite runs, no stress loops. Builds and tests run on Runpod through
    release.sh / scripts/ubuntu2604/remote-build.sh; reproduce a failing test by rerunning the remote build.
+7. A git hook on this host rejects commits whose staged diff has not been reviewed. Before each of
+   your own commits run `review diff --staged --task sync-{{TAG}} -C "$PWD" </dev/null` (no timeout, it
+   takes minutes), then commit. release.sh reviews its own build bump commit. Never use `--no-verify`
+   and never create review stamps or markers by hand.
 
 When done, the last line of your answer must be exactly `RESULT: published <tag>` or
 `RESULT: failed <one-line reason>`. If you cannot finish, leave the working tree clean (commit
