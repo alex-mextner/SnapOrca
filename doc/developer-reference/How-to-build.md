@@ -275,7 +275,7 @@ Linux builds check `ORCA_LINUX_UPDATE_URL` (`version.inc`; default: the fork's `
 
 Fix model (right-click an object in the object list → "Fix model") is available in Linux builds of this fork. It is the CGAL repair of [OrcaSlicer#12155](https://github.com/OrcaSlicer/OrcaSlicer/pull/12155), ported by ealap and built here against Ubuntu's CGAL. It runs on a copy of the object off the GUI thread, so the window stays responsive and Cancel leaves the object unchanged. Volumes that are already closed and consistently oriented are left untouched. Broken ones get duplicate vertices merged, degenerate faces removed, holes filled, faces reoriented, and nested shells kept as booleans by nesting level (a cavity stays a cavity).
 
-Paint (color, supports, seams, fuzzy skin) on a repaired volume is lost, because its triangles change; untouched volumes keep it. Self-intersections cannot be removed without changing the shape, so Fix model reports them as a warning instead. Upstream draft: [Snapmaker#991](https://github.com/Snapmaker/OrcaSlicer/pull/991).
+Paint (color, supports, seams, fuzzy skin) on a repaired volume is lost, because its triangles change; untouched volumes keep it. Self-intersections cannot be removed without changing the shape, so Fix model reports them as a warning instead. Upstream drafts: [Snapmaker#991](https://github.com/Snapmaker/OrcaSlicer/pull/991), [OrcaSlicer#16360](https://github.com/OrcaSlicer/OrcaSlicer/pull/16360).
 
 #### STEP surface models
 
