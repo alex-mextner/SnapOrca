@@ -16,6 +16,10 @@
 # everything uncached in RUNPOD_POD_DCS (comma list, tried in order; also the data centers of every
 # pod without the volume). Flavors are tried in RUNPOD_CPU_FLAVORS order.
 #
+# RUNPOD_VCPU sets the pod size; by default a pod with the volume and a dependencies key gets 16 vCPU
+# (the slicer mostly comes from ccache, and a deps cache miss costs about the same in pod-hours at 16),
+# a pod that must build the dependencies anyway (no volume, modified deps/) gets 32.
+#
 # Runpod sometimes schedules a pod that never starts (no runtime, no SSH port) while reporting the
 # data center's stock as high. A pod without an SSH port after RUNPOD_START_MINUTES is deleted and
 # replaced once, uncached, in the data centers of RUNPOD_POD_DCS after the one that failed.
@@ -34,7 +38,6 @@ POD_ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 
 FORK_REPO=${FORK_REPO:-alex-mextner/SnapOrca}
 FLAVORS=${RUNPOD_CPU_FLAVORS:-cpu5c,cpu3c} # compute-optimized, 2 GB RAM per vCPU
-VCPU=${RUNPOD_VCPU:-32}                    # power of two, flavor maximum is 32
 MAX_HOURS=${RUNPOD_MAX_HOURS:-3}
 VOLUME=${RUNPOD_VOLUME:-snap-orca-cache}
 VOLUME_DC=${RUNPOD_DC:-EU-RO-1}            # has cpu5c and cpu3c
@@ -97,9 +100,13 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 # Dependencies cache key: everything that feeds deps/build/destdir (none for a modified tree).
+# deps/mesa is a Windows-only prebuilt opengl32.dll that deps/CMakeLists.txt never builds; Snapmaker's
+# main has it and the fork does not, so leaving it out lets both share one cached deps archive. The
+# provision.sh part hashes the working file: Snapmaker branches carry it uncommitted.
 deps_key=""
-if [[ -z $(git status --porcelain -- deps scripts/ubuntu2604/provision.sh) ]]; then
-    deps_key="$(git rev-parse HEAD:deps | cut -c1-12)-$(git rev-parse HEAD:scripts/ubuntu2604/provision.sh | cut -c1-8)"
+if [[ -f scripts/ubuntu2604/provision.sh && -z $(git status --porcelain -- deps ':!deps/mesa') ]]; then
+    deps_tree=$(git ls-tree HEAD:deps | grep -v $'\tmesa$' | git mktree)
+    deps_key="$(cut -c1-12 <<<"$deps_tree")-$(git hash-object scripts/ubuntu2604/provision.sh | cut -c1-8)"
 fi
 # The pod provisions itself while this script waits for SSH, from the pushed commit's provision.sh;
 # a locally modified one is run over SSH after the sync instead.
@@ -161,8 +168,14 @@ ssh-keygen -A
 exec /usr/sbin/sshd -D -e
 EOF
 )
+pod_vcpu() { # pod_vcpu VOLUME_ID: the pod's vCPU count (a power of two, flavor maximum is 32)
+    if [[ -n ${RUNPOD_VCPU:-} ]]; then echo "$RUNPOD_VCPU"
+    elif [[ -n $1 && -n $deps_key ]]; then echo 16
+    else echo 32
+    fi
+}
 pod_request() { # pod_request VOLUME_ID FLAVOR DCS: the create body, without a volume when VOLUME_ID is empty
-    python3 - "$2" "$VCPU" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" "$POD_ROOT" "$deps_key" "$provision_url" \
+    python3 - "$2" "$(pod_vcpu "$1")" "$((MAX_HOURS * 3600))" "$(cat "$SSH_KEY.pub")" "$boot" "$POD_ROOT" "$deps_key" "$provision_url" \
         "$1" "$VOLUME_DC" "$3" <<'EOF'
 import json, sys
 flavor, vcpu, max_seconds, pubkey, boot, root, deps_key, provision_url, volume, volume_dc, dcs = sys.argv[1:]
@@ -251,7 +264,7 @@ next_dcs() {
     (IFS=,; echo "${dcs[*]}")
 }
 
-step "creating pod ($VCPU vCPU, $FLAVORS, $(if [[ -n $volume_id ]]; then echo "cache volume in $VOLUME_DC"; else echo "in $POD_DCS"; fi))"
+step "creating pod ($(pod_vcpu "$volume_id") vCPU, $FLAVORS, $(if [[ -n $volume_id ]]; then echo "cache volume in $VOLUME_DC"; else echo "in $POD_DCS"; fi))"
 rc=0
 start_pod "$volume_id" "$POD_DCS" || rc=$?
 if ((rc == 2)) && [[ -n $volume_id ]]; then
