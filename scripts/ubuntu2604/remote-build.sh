@@ -4,10 +4,20 @@
 # AppImage into build/. The pod is deleted when this script exits; as backstops a detached local
 # process, and the pod itself when Runpod gives it its credentials, delete it after RUNPOD_MAX_HOURS.
 #
-#   scripts/ubuntu2604/remote-build.sh
+#   scripts/ubuntu2604/remote-build.sh [CTEST_ARG...]
+#   scripts/ubuntu2604/remote-build.sh --session start|run [CTEST_ARG...]|stop
 #
 # The pod checks out HEAD from the fork (pushed to a temporary remote-build/<sha> branch, deleted
 # afterwards) and receives uncommitted changes over rsync, so the build matches the working tree.
+# CTEST_ARGs go to ctest (e.g. -R 'CGAL repair'); REMOTE_APPIMAGE=0 skips the AppImage.
+#
+# A session keeps one pod for a red/green loop: `start` creates the pod, checks out HEAD and
+# provisions it; each `run` copies the files that changed since that checkout (rsync, content
+# compared), then builds incrementally (ninja keeps the build directory) and runs ctest; `stop`
+# deletes the pod and waits for the API's 404. The pod still deletes itself, and a detached local
+# process deletes it, RUNPOD_MAX_HOURS after `start`. The state (pod, address, files sent) lives in
+# the git directory, shared by all worktrees. One pod at a time: while a session pod exists, a
+# plain run and `start` refuse, and gui-test/remote-test.sh runs its tests on the session pod.
 #
 # Caches live on a Runpod network volume (RUNPOD_VOLUME, created on first use in RUNPOD_DC and
 # mounted at /workspace): the built dependencies per deps/ tree + provision.sh, the ccache of the
@@ -52,6 +62,17 @@ API=https://rest.runpod.io/v1
 die() { echo "remote-build.sh: $1" >&2; exit "${2:-1}"; }
 step() { printf '== [%dm%02ds] %s\n' $((SECONDS / 60)) $((SECONDS % 60)) "$*"; }
 
+mode=once
+if [[ ${1:-} == --session ]]; then
+    case ${2:-} in start | run | stop) mode=$2 ;; *) die "usage: remote-build.sh [--session start|run|stop] [CTEST_ARG...]" 2 ;; esac
+    shift 2
+    [[ $mode == run || $# == 0 ]] || die "--session $mode takes no ctest arguments" 2
+fi
+ctest_args=""
+(($# == 0)) || ctest_args=$(printf ' %q' "$@")
+APPIMAGE=${REMOTE_APPIMAGE:-1}
+[[ $APPIMAGE == [01] ]] || die "REMOTE_APPIMAGE must be 0 or 1" 2
+
 api_key=${RUNPOD_API_KEY:-$(sed -nE 's/^apikey *= *"(.*)"/\1/p' "$HOME/.runpod/config.toml" 2>/dev/null || true)}
 [[ -n $api_key ]] || die "no Runpod API key: set RUNPOD_API_KEY or run runpodctl doctor"
 [[ -r $SSH_KEY.pub ]] || die "missing $SSH_KEY.pub"
@@ -78,6 +99,12 @@ build_ref=refs/heads/remote-build/$sha
 fork_url=https://github.com/$FORK_REPO.git
 pod_id=""
 watchdog_pid=""
+session_dir=$(git rev-parse --path-format=absolute --git-common-dir)/remote-build-session
+# The session state, set by session_live from $session_dir/state.
+s_pod="" s_ip="" s_port="" s_dc="" s_cost="" s_mem="" s_volume="" s_deps_key="" s_sha="" s_started="" s_expires="" s_watchdog=""
+# One pod at a time: remote-build.sh and gui-test/remote-test.sh hold this lock while they run.
+exec 9>"$session_dir.lock"
+flock -n 9 || die "another remote-build.sh or remote-test.sh of this repository is running (lock: $session_dir.lock)"
 
 cleanup() {
     local rc=$?
@@ -92,7 +119,9 @@ cleanup() {
     elif [[ -n $watchdog_pid ]]; then
         kill -- "-$watchdog_pid" 2>/dev/null || true
     fi
-    git push -q "$fork_url" ":$build_ref" 2>/dev/null || true
+    # A session that failed to start leaves no state behind.
+    [[ $mode != start || -f $session_dir/state ]] || rm -rf "$session_dir"
+    [[ $mode == run || $mode == stop ]] || git push -q "$fork_url" ":$build_ref" 2>/dev/null || true
     rm -rf "$tmp"
     exit "$rc"
 }
@@ -113,25 +142,6 @@ fi
 provision_url=""
 if git diff --quiet HEAD -- scripts/ubuntu2604/provision.sh; then
     provision_url="https://raw.githubusercontent.com/$FORK_REPO/$sha/scripts/ubuntu2604/provision.sh"
-fi
-
-step "pushing $sha to $build_ref"
-git push -q "$fork_url" "$sha:$build_ref" # named by the sha: an existing branch already matches
-
-# A failed lookup builds uncached rather than creating a second volume.
-if volumes=$(api "$API/networkvolumes"); then
-    volume_id=$(python3 -c 'import json, sys
-for v in json.loads(sys.argv[3]):
-    if v.get("name") == sys.argv[1] and v.get("dataCenterId") == sys.argv[2]:
-        print(v["id"]); break' "$VOLUME" "$VOLUME_DC" "$volumes")
-    if [[ -z $volume_id ]]; then
-        step "creating cache volume $VOLUME ($VOLUME_GB GB in $VOLUME_DC)"
-        volume_id=$(api -X POST "$API/networkvolumes" -d "{\"name\":\"$VOLUME\",\"size\":$VOLUME_GB,\"dataCenterId\":\"$VOLUME_DC\"}" | field id || true)
-        [[ -n $volume_id ]] || echo "remote-build.sh: warning: could not create the cache volume, building uncached" >&2
-    fi
-else
-    volume_id=""
-    echo "remote-build.sh: warning: could not list network volumes, building uncached" >&2
 fi
 
 # Plain ubuntu:26.04: the start command installs and starts sshd, then in the background installs
@@ -228,7 +238,7 @@ start_pod() {
     [[ -z $watchdog_pid ]] || kill -- "-$watchdog_pid" 2>/dev/null || true
     # shellcheck disable=SC2016 # $RP_KEY and $RP_POD are expanded by the detached bash
     RP_KEY=$api_key RP_POD=$pod_id setsid bash -c "sleep $((MAX_HOURS * 3600)); "'printf "header = \"Authorization: Bearer %s\"\n" "$RP_KEY" | curl -fsS -m 60 -K - -X DELETE "'"$API"'/pods/$RP_POD"' \
-        </dev/null >/dev/null 2>&1 &
+        </dev/null >/dev/null 2>&1 9>&- &
     watchdog_pid=$!
     ip="" port="" pod_dc=""
     # Where a pod that never gets a machine was meant to go: the first data center asked for.
@@ -264,35 +274,105 @@ next_dcs() {
     (IFS=,; echo "${dcs[*]}")
 }
 
-step "creating pod ($(pod_vcpu "$volume_id") vCPU, $FLAVORS, $(if [[ -n $volume_id ]]; then echo "cache volume in $VOLUME_DC"; else echo "in $POD_DCS"; fi))"
-rc=0
-start_pod "$volume_id" "$POD_DCS" || rc=$?
-if ((rc == 2)) && [[ -n $volume_id ]]; then
-    echo "remote-build.sh: warning: no capacity next to the cache volume in $VOLUME_DC, building uncached" >&2
-    volume_id=""
-    rc=0
-    start_pod "" "$POD_DCS" || rc=$?
+# ---- the pod: a new one, or the session's ----
+# session_live: loads the session state (s_*); 0 while its pod exists, 1 when there is no session (a
+# pod the API no longer knows, 404, takes its state along). Any other answer stops the script: a
+# network or API failure must neither drop the state of a pod that still bills nor start a second one.
+session_live() {
+    local code
+    [[ -f $session_dir/state ]] || return 1
+    # shellcheck source=/dev/null
+    source "$session_dir/state"
+    code=$(api_status "$API/pods/$s_pod")
+    [[ $code != 200 ]] || return 0
+    [[ $code == 404 ]] || die "cannot tell whether the session pod $s_pod still exists (Runpod API: HTTP $code); state kept, try again"
+    rm -rf "$session_dir"
+    return 1
+}
+if [[ $mode == stop ]]; then
+    session_live || die "no session pod is running"
+    step "deleting session pod $s_pod"
+    delete_pod "$s_pod" || die "could not delete the session pod $s_pod, delete it in the Runpod console"
+    # The detached deleter's process group, unless its pid was reused since (args differ then).
+    [[ $(ps -o args= -p "$s_watchdog" 2>/dev/null) != "bash -c sleep"* ]] || kill -- "-$s_watchdog" 2>/dev/null || true
+    rm -rf "$session_dir"
+    secs=$(($(date +%s) - s_started))
+    step "session pod $s_pod deleted (API: 404) after $((secs / 60)) min, about \$$(python3 -c "print(f'{${s_cost:-0} * $secs / 3600:.3f}')") at \$${s_cost:-?}/h"
+    exit 0
 fi
-((rc != 2)) || die "pod creation failed"
-if ((rc == 1)); then
-    # One retry, uncached: the volume would pin the new pod to the same data center.
-    stuck_dc=${pod_dc:-$first_dc}
-    retry_dcs=$(next_dcs "$stuck_dc")
-    retry_dcs=${retry_dcs:-$POD_DCS} # RUNPOD_POD_DCS was only the failed data center
-    echo "remote-build.sh: warning: pod $pod_id${stuck_dc:+ in $stuck_dc} got no SSH port in $START_MINUTES min, deleting it and building uncached in $retry_dcs" >&2
-    stuck_id=$pod_id
-    delete_pod "$stuck_id" || die "could not delete the stuck pod $stuck_id" # cleanup tries again
-    pod_id=""
-    step "pod $stuck_id deleted"
-    volume_id=""
+# A session pod keeps the dependencies it started with.
+[[ $mode == once || -n $deps_key ]] || die "a session needs an unmodified deps/ (no dependencies key); use a plain remote-build.sh"
+if [[ $mode == run ]]; then
+    session_live || die "no session pod is running (stopped, or deleted after RUNPOD_MAX_HOURS): use --session start"
+    [[ $deps_key == "$s_deps_key" ]] || die "deps/ or provision.sh changed since the session started: --session stop, then start a new one"
+    # The address as the API reports it now, in case Runpod moved the pod's SSH port.
+    pod=$(api "$API/pods/$s_pod" || true)
+    ip=$(field publicIp <<<"$pod") port=$(field portMappings 22 <<<"$pod")
+    ip=${ip:-$s_ip} port=${port:-$s_port} volume_id=$s_volume pod_mem=$s_mem
+    known_hosts=$session_dir/known_hosts
+    step "session pod $s_pod in $s_dc, \$$s_cost/h, deleted at $(date -d "@$s_expires" +%H:%M) unless stopped earlier"
+else
+    if session_live; then
+        die "session pod $s_pod is running (one pod at a time): use --session run, or --session stop first"
+    fi
+    rm -rf "$session_dir"
+    known_hosts=$tmp/known_hosts
+    if [[ $mode == start ]]; then
+        mkdir -p "$session_dir"
+        known_hosts=$session_dir/known_hosts
+    fi
+
+    step "pushing $sha to $build_ref"
+    git push -q "$fork_url" "$sha:$build_ref" # named by the sha: an existing branch already matches
+
+    # A failed lookup builds uncached rather than creating a second volume.
+    if volumes=$(api "$API/networkvolumes"); then
+        volume_id=$(python3 -c 'import json, sys
+for v in json.loads(sys.argv[3]):
+    if v.get("name") == sys.argv[1] and v.get("dataCenterId") == sys.argv[2]:
+        print(v["id"]); break' "$VOLUME" "$VOLUME_DC" "$volumes")
+        if [[ -z $volume_id ]]; then
+            step "creating cache volume $VOLUME ($VOLUME_GB GB in $VOLUME_DC)"
+            volume_id=$(api -X POST "$API/networkvolumes" -d "{\"name\":\"$VOLUME\",\"size\":$VOLUME_GB,\"dataCenterId\":\"$VOLUME_DC\"}" | field id || true)
+            [[ -n $volume_id ]] || echo "remote-build.sh: warning: could not create the cache volume, building uncached" >&2
+        fi
+    else
+        volume_id=""
+        echo "remote-build.sh: warning: could not list network volumes, building uncached" >&2
+    fi
+
+    started=$(date +%s)
+    step "creating pod ($(pod_vcpu "$volume_id") vCPU, $FLAVORS, $(if [[ -n $volume_id ]]; then echo "cache volume in $VOLUME_DC"; else echo "in $POD_DCS"; fi))"
     rc=0
-    start_pod "" "$retry_dcs" || rc=$?
+    start_pod "$volume_id" "$POD_DCS" || rc=$?
+    if ((rc == 2)) && [[ -n $volume_id ]]; then
+        echo "remote-build.sh: warning: no capacity next to the cache volume in $VOLUME_DC, building uncached" >&2
+        volume_id=""
+        rc=0
+        start_pod "" "$POD_DCS" || rc=$?
+    fi
     ((rc != 2)) || die "pod creation failed"
-    ((rc == 0)) || die "pod $pod_id${pod_dc:+ in $pod_dc} got no SSH port in $START_MINUTES min either"
+    if ((rc == 1)); then
+        # One retry, uncached: the volume would pin the new pod to the same data center.
+        stuck_dc=${pod_dc:-$first_dc}
+        retry_dcs=$(next_dcs "$stuck_dc")
+        retry_dcs=${retry_dcs:-$POD_DCS} # RUNPOD_POD_DCS was only the failed data center
+        echo "remote-build.sh: warning: pod $pod_id${stuck_dc:+ in $stuck_dc} got no SSH port in $START_MINUTES min, deleting it and building uncached in $retry_dcs" >&2
+        stuck_id=$pod_id
+        delete_pod "$stuck_id" || die "could not delete the stuck pod $stuck_id" # cleanup tries again
+        pod_id=""
+        step "pod $stuck_id deleted"
+        volume_id=""
+        rc=0
+        start_pod "" "$retry_dcs" || rc=$?
+        ((rc != 2)) || die "pod creation failed"
+        ((rc == 0)) || die "pod $pod_id${pod_dc:+ in $pod_dc} got no SSH port in $START_MINUTES min either"
+    fi
+    pod_mem=$(field memoryInGb <<<"$pod")
 fi
 
 ssh_opts=(-i "$SSH_KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30
-          -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$tmp/known_hosts")
+          -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$known_hosts")
 # shellcheck disable=SC2029 # the commands are meant to run on the pod
 on_pod() { ssh "${ssh_opts[@]}" "root@$ip" "$@"; }
 # on_pod_script ARG...: runs the script on stdin with these arguments (quoted: ssh joins argv into
@@ -302,33 +382,53 @@ for _ in $(seq 60); do
     on_pod true 2>/dev/null && break
     sleep 5
 done
-on_pod true || die "pod $pod_id: SSH on $ip:$port does not answer"
-step "pod reachable at $ip:$port"
-if ! on_pod 'tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_API_KEY=." && tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_POD_ID=."'; then
-    echo "remote-build.sh: warning: Runpod gave the pod no API key, so it cannot delete itself; a pod orphaned by this machine going down keeps billing" >&2
-fi
+on_pod true || die "pod ${pod_id:-$s_pod}: SSH on $ip:$port does not answer"
 
-step "checkout"
-on_pod_script "$POD_ROOT" "$fork_url" "$sha" <<'EOF'
+if [[ $mode == run ]]; then
+    # Every file that differs from the session's checkout now or did in an earlier run (so a reverted
+    # edit goes back too); --checksum without -t: only files whose content differs are written, with
+    # the pod's time, so ninja rebuilds exactly those whatever this machine's clock says.
+    : >"$tmp/present"
+    : >"$tmp/missing"
+    { cat "$session_dir/synced" 2>/dev/null || true
+      git diff --no-renames --name-only -z "$s_sha"
+      git ls-files -z -o --exclude-standard
+    } | sort -zu >"$tmp/set"
+    while IFS= read -r -d '' f; do
+        if [[ -e $f || -L $f ]]; then printf '%s\0' "$f" >>"$tmp/present"; else printf '%s\0' "$f" >>"$tmp/missing"; fi
+    done <"$tmp/set"
+    step "syncing $(tr -cd '\0' <"$tmp/present" | wc -c) changed files, deleting $(tr -cd '\0' <"$tmp/missing" | wc -c)"
+    # Deletions first, and --force: a directory replaced by a file of the same name must give way.
+    [[ ! -s $tmp/missing ]] || on_pod "cd '$POD_ROOT' && xargs -0 rm -f --" <"$tmp/missing"
+    [[ ! -s $tmp/present ]] || rsync -rlpz --force --checksum --from0 --files-from="$tmp/present" -e "ssh ${ssh_opts[*]}" ./ "root@$ip:$POD_ROOT/"
+    cp "$tmp/set" "$session_dir/synced.tmp" && mv "$session_dir/synced.tmp" "$session_dir/synced"
+else
+    step "pod reachable at $ip:$port"
+    if ! on_pod 'tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_API_KEY=." && tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_POD_ID=."'; then
+        echo "remote-build.sh: warning: Runpod gave the pod no API key, so it cannot delete itself; a pod orphaned by this machine going down keeps billing" >&2
+    fi
+
+    step "checkout"
+    on_pod_script "$POD_ROOT" "$fork_url" "$sha" <<'EOF'
 set -euo pipefail
 mkdir -p "$1" && cd "$1"
 git init -q && git fetch -q --depth 1 "$2" "$3" && git checkout -q FETCH_HEAD
 EOF
 
-# Uncommitted changes: modified and untracked (not ignored) files, and deletions.
-git diff --name-only -z HEAD --diff-filter=d >"$tmp/changed"
-git ls-files -z -o --exclude-standard >>"$tmp/changed"
-if [[ -s $tmp/changed ]]; then
-    step "syncing $(tr -cd '\0' <"$tmp/changed" | wc -c) uncommitted files"
-    rsync -az --from0 --files-from="$tmp/changed" -e "ssh ${ssh_opts[*]}" ./ "root@$ip:$POD_ROOT/"
-fi
-deleted=$(git diff --name-only HEAD --diff-filter=D)
-if [[ -n $deleted ]]; then
-    printf '%s\n' "$deleted" | on_pod "cd '$POD_ROOT' && xargs -d '\n' rm -f --"
-fi
+    # Uncommitted changes: modified and untracked (not ignored) files, and deletions.
+    git diff --no-renames --name-only -z HEAD --diff-filter=d >"$tmp/changed"
+    git ls-files -z -o --exclude-standard >>"$tmp/changed"
+    if [[ -s $tmp/changed ]]; then
+        step "syncing $(tr -cd '\0' <"$tmp/changed" | wc -c) uncommitted files"
+        rsync -az --from0 --files-from="$tmp/changed" -e "ssh ${ssh_opts[*]}" ./ "root@$ip:$POD_ROOT/"
+    fi
+    git diff --no-renames --name-only -z HEAD --diff-filter=D >"$tmp/deleted"
+    if [[ -s $tmp/deleted ]]; then
+        on_pod "cd '$POD_ROOT' && xargs -0 rm -f --" <"$tmp/deleted"
+    fi
 
-step "waiting for provisioning and caches"
-on_pod_script "$POD_ROOT" "$provision_url" <<'EOF'
+    step "waiting for provisioning and caches"
+    on_pod_script "$POD_ROOT" "$provision_url" <<'EOF'
 set -euo pipefail
 root=$1 provision_url=$2
 cd "$root"
@@ -348,13 +448,33 @@ fi
 [[ $rc == 0 ]] || { tail -50 /root/provision.log; exit 1; }
 wait_for /root/cache.done
 EOF
+fi
 
-on_pod_script "$POD_ROOT" "$deps_key" "${volume_id:+1}" "${REMOTE_EXTRA_CMD:-}" "$(field memoryInGb <<<"$pod")" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
+if [[ $mode == start ]]; then
+    # Written aside and renamed: a run never reads half a state or file list.
+    cat "$tmp/changed" "$tmp/deleted" >"$session_dir/synced.tmp" && mv "$session_dir/synced.tmp" "$session_dir/synced"
+    expires=$((started + MAX_HOURS * 3600))
+    {
+        printf 's_pod=%q s_ip=%q s_port=%q s_dc=%q s_cost=%q s_mem=%q\n' "$pod_id" "$ip" "$port" "$pod_dc" "$(field costPerHr <<<"$pod")" "$pod_mem"
+        printf 's_volume=%q s_deps_key=%q s_sha=%q s_started=%q s_expires=%q s_watchdog=%q\n' "$volume_id" "$deps_key" "$sha" "$started" "$expires" "$watchdog_pid"
+    } >"$session_dir/state.tmp"
+    mv "$session_dir/state.tmp" "$session_dir/state"
+    step "session pod $pod_id ready, deleted at $(date -d "@$expires" +%H:%M) (RUNPOD_MAX_HOURS) unless stopped earlier. Next: --session run [CTEST_ARG...], finally --session stop"
+    pod_id="" watchdog_pid="" # kept: the pod and its detached deleter
+    exit 0
+fi
+on_pod_script "$POD_ROOT" "$deps_key" "${volume_id:+1}" "${REMOTE_EXTRA_CMD:-}" "$pod_mem" "$ctest_args" "$APPIMAGE" <<'EOF' || { rc=$?; [[ $rc == 12 ]] && die "tests failed on the pod" 12; die "build failed on the pod" 11; }
 set -euo pipefail
-root=$1 deps_key=$2 volume=$3 extra_cmd=$4 pod_mem_gb=${5%%.*}
+root=$1 deps_key=$2 volume=$3 extra_cmd=$4 pod_mem_gb=${5%%.*} ctest_args=$6 appimage=$7
 cd "$root"
-flags=-sitr
-[[ -f /root/deps.restored ]] || flags=-dsitr
+# deps.restored: unpacked from the cache, or built by an earlier run on this (session) pod.
+build_deps=""
+[[ -f /root/deps.restored ]] || build_deps=1
+flags=-
+[[ -z $build_deps ]] || flags+=d
+flags+=s
+[[ $appimage != 1 ]] || flags+=i
+flags+=tr
 # Parallel jobs: the vCPUs the pod may use (cgroup quota, nproc shows the host), capped at
 # 2 GB of RAM per job (the heaviest libslic3r units need about that much). The RAM is the smallest
 # of the host, the cgroup limit and the pod size Runpod reports (the cgroup may say "max").
@@ -395,7 +515,8 @@ trap finish EXIT
 
 echo "== [$(date +%T)] build_linux.sh $flags"
 ./build_linux.sh "$flags" || exit 11
-if [[ $flags == -dsitr && -n $deps_key && -n $volume ]]; then
+touch /root/deps.restored
+if [[ -n $build_deps && -n $deps_key && -n $volume ]]; then
     echo "== caching dependencies $deps_key"
     mkdir -p /workspace/deps
     tar -C deps/build -cf - destdir | zstd -T0 -10 -q -o "/workspace/deps/$deps_key.tar.zst.$$"
@@ -406,7 +527,9 @@ fi
 echo "== [$(date +%T)] tests: build"
 cmake --build build --config Release || exit 11
 echo "== [$(date +%T)] tests: run"
-cd build && ctest -C Release -j1 --output-on-failure || exit 12
+eval "ctest_args=($ctest_args)" # shell-quoted by remote-build.sh
+# --no-tests=error: a -R filter that matches nothing must not pass as green.
+cd build && ctest -C Release -j1 --output-on-failure --no-tests=error "${ctest_args[@]}" || exit 12
 # REMOTE_EXTRA_CMD (e.g. repeat a flaky test): counted as a test failure when it fails.
 if [[ -n $extra_cmd ]]; then
     echo "== [$(date +%T)] extra: $extra_cmd"
@@ -414,6 +537,7 @@ if [[ -n $extra_cmd ]]; then
 fi
 EOF
 
+[[ $APPIMAGE == 1 ]] || { step "done (REMOTE_APPIMAGE=0: no AppImage)"; exit 0; }
 step "fetching the AppImage"
 rsync -a -e "ssh ${ssh_opts[*]}" "root@$ip:$POD_ROOT/build/Snapmaker_Orca_Linux_V*.AppImage" build/
 step "done: $(ls build/Snapmaker_Orca_Linux_V*.AppImage)"

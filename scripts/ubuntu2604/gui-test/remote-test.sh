@@ -20,6 +20,9 @@
 # (default 4): Runpod sometimes schedules a pod that never starts (no runtime, no SSH port) while
 # reporting the data center's stock as high; such a pod is deleted after that long and replaced
 # once in the data centers of RUNPOD_POD_DCS after the one that failed.
+# One pod at a time: while a remote-build.sh session pod exists (remote-build.sh --session start),
+# the tests run on that pod, which stays up. remote-build.sh and this script share a lock, so neither
+# starts while the other runs.
 # Exit status: 0 every test passed, 1 a test failed, 2 usage error, other: pod / transfer errors.
 set -euo pipefail
 
@@ -106,15 +109,22 @@ print("" if v is None else v)' "$@"
 
 mkdir -p "$OUT"
 LOG=$(readlink -f "$OUT")/remote-$(date +%Y%m%d-%H%M%S).log
+session_dir=$(git -C "$HERE" rev-parse --path-format=absolute --git-common-dir)/remote-build-session
+exec 9>"$session_dir.lock" # shared with remote-build.sh
+flock -n 9 || die "another remote-build.sh or remote-test.sh of this repository is running (lock: $session_dir.lock)"
 tmp=$(mktemp -d)
 pod_id=""
 pod_start=""
 cost=""
 ip=""
 watchdog_pid=""
+session_pod="" # the remote-build.sh session pod the tests run on, if any
+fetched=""
+known_hosts=$tmp/known_hosts
 
 fetch_results() {
-    [[ -n $ip ]] || return 0
+    [[ -n $ip && -z $fetched ]] || return 0
+    fetched=1
     rsync -a -e "ssh ${ssh_opts[*]}" "root@$ip:$POD_HOME/results/" "$OUT/" 2>>"$LOG" ||
         echo "remote-test.sh: could not copy the results from the pod" | tee -a "$LOG" >&2
 }
@@ -135,6 +145,10 @@ cleanup() {
         fi
     elif [[ -n $watchdog_pid ]]; then
         kill -- "-$watchdog_pid" 2>/dev/null || true
+    fi
+    if [[ -n $session_pod ]]; then
+        fetch_results
+        step "session pod $session_pod kept (remote-build.sh --session stop deletes it)"
     fi
     rm -rf "$tmp"
     exit "$rc"
@@ -206,7 +220,7 @@ start_pod() {
     [[ -z $watchdog_pid ]] || kill -- "-$watchdog_pid" 2>/dev/null || true
     # shellcheck disable=SC2016 # $RP_KEY/$RP_POD expand in the detached shell, not here
     RP_KEY=$api_key RP_POD=$pod_id setsid bash -c "sleep $((MAX_HOURS * 3600)); "'printf "header = \"Authorization: Bearer %s\"\n" "$RP_KEY" | curl -fsS -m 60 -K - -X DELETE "'"$API"'/pods/$RP_POD"' \
-        </dev/null >/dev/null 2>&1 &
+        </dev/null >/dev/null 2>&1 9>&- &
     watchdog_pid=$!
     ip="" port="" pod_dc=""
     first_dc=${1%%,*} # where a pod that never gets a machine was meant to go
@@ -242,44 +256,68 @@ next_dcs() {
 
 step "${#tests[@]} test(s), ${#uploads[@]} file(s) to upload; results in $OUT"
 for t in "${tests[@]}"; do echo "   $t" | tee -a "$LOG"; done
-step "creating pod ($VCPU vCPU, $FLAVORS, in $POD_DCS)"
-rc=0
-start_pod "$POD_DCS" || rc=$?
-((rc != 2)) || die "pod creation failed: $(cat "$tmp/create.err")"
-if ((rc == 1)); then
-    stuck_dc=${pod_dc:-$first_dc}
-    retry_dcs=$(next_dcs "$stuck_dc")
-    retry_dcs=${retry_dcs:-$POD_DCS} # RUNPOD_POD_DCS was only the failed data center
-    echo "remote-test.sh: warning: pod $pod_id in $stuck_dc got no SSH port in $START_MINUTES min, deleting it and retrying in $retry_dcs" | tee -a "$LOG" >&2
-    stuck_id=$pod_id
-    delete_pod "$stuck_id" || die "could not delete the stuck pod $stuck_id" # cleanup tries again
-    pod_id=""
-    step "pod $stuck_id deleted"
+s_pod="" s_ip="" s_port="" s_dc="" s_cost=""
+if [[ -f $session_dir/state ]]; then
+    # shellcheck source=/dev/null
+    source "$session_dir/state"
+    code=$(api_status "$API/pods/$s_pod")
+    # Anything but a clear answer stops here: a second pod must not start next to a live session.
+    case $code in
+        200) ;;
+        404) s_pod="" ;; # remote-build.sh removes the state on its next start or run
+        *) die "cannot tell whether the session pod $s_pod still exists (Runpod API: HTTP $code); try again" ;;
+    esac
+fi
+if [[ -n $s_pod ]]; then
+    # The address as the API reports it now, in case Runpod moved the pod's SSH port.
+    pod=$(api "$API/pods/$s_pod" || true)
+    ip=$(field publicIp <<<"$pod") port=$(field portMappings 22 <<<"$pod")
+    session_pod=$s_pod ip=${ip:-$s_ip} port=${port:-$s_port} cost=$s_cost
+    known_hosts=$session_dir/known_hosts
+    step "on the remote-build.sh session pod $session_pod in $s_dc (\$$cost/h)"
+else
+    step "creating pod ($VCPU vCPU, $FLAVORS, in $POD_DCS)"
     rc=0
-    start_pod "$retry_dcs" || rc=$?
+    start_pod "$POD_DCS" || rc=$?
     ((rc != 2)) || die "pod creation failed: $(cat "$tmp/create.err")"
-    ((rc == 0)) || die "pod $pod_id${pod_dc:+ in $pod_dc} got no SSH port in $START_MINUTES min either"
+    if ((rc == 1)); then
+        stuck_dc=${pod_dc:-$first_dc}
+        retry_dcs=$(next_dcs "$stuck_dc")
+        retry_dcs=${retry_dcs:-$POD_DCS} # RUNPOD_POD_DCS was only the failed data center
+        echo "remote-test.sh: warning: pod $pod_id in $stuck_dc got no SSH port in $START_MINUTES min, deleting it and retrying in $retry_dcs" | tee -a "$LOG" >&2
+        stuck_id=$pod_id
+        delete_pod "$stuck_id" || die "could not delete the stuck pod $stuck_id" # cleanup tries again
+        pod_id=""
+        step "pod $stuck_id deleted"
+        rc=0
+        start_pod "$retry_dcs" || rc=$?
+        ((rc != 2)) || die "pod creation failed: $(cat "$tmp/create.err")"
+        ((rc == 0)) || die "pod $pod_id${pod_dc:+ in $pod_dc} got no SSH port in $START_MINUTES min either"
+    fi
 fi
 ssh_opts=(-i "$SSH_KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30
-          -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$tmp/known_hosts")
+          -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$known_hosts")
 # shellcheck disable=SC2029 # commands are built locally on purpose
 on_pod() { ssh "${ssh_opts[@]}" "root@$ip" "$@"; }
 for _ in $(seq 60); do
     on_pod true 2>/dev/null && break
     sleep 5
 done
-on_pod true || die "pod $pod_id: SSH on $ip:$port does not answer"
+on_pod true || die "pod ${pod_id:-$session_pod}: SSH on $ip:$port does not answer"
 step "pod reachable at $ip:$port"
-if ! on_pod 'tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_API_KEY=." && tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_POD_ID=."'; then
+if [[ -z $session_pod ]] && ! on_pod 'tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_API_KEY=." && tr "\0" "\n" </proc/1/environ | grep -q "^RUNPOD_POD_ID=."'; then
     echo "remote-test.sh: warning: Runpod gave the pod no API key, so it cannot delete itself; a pod orphaned by this machine going down keeps billing" | tee -a "$LOG" >&2
 fi
 
-step "provisioning (provision.sh, provision-gui.sh, iproute2, numpy/scipy/trimesh for analyze-3mf.py) while uploading"
-on_pod "useradd -m -d $POD_HOME gui && mkdir -p $POD_HARNESS $POD_HOME/results && touch /etc/snap-orca-throwaway"
+step "provisioning (provision.sh, provision-gui.sh, iproute2, numpy/scipy/trimesh for analyze-3mf.py; skipped on a pod provisioned by the same scripts) while uploading"
+# A session pod keeps the gui user and its packages between runs, but not earlier results.
+on_pod "{ id gui >/dev/null 2>&1 || useradd -m -d $POD_HOME gui; } && rm -rf $POD_HOME/results && mkdir -p $POD_HARNESS $POD_HOME/results && touch /etc/snap-orca-throwaway"
 rsync -a -e "ssh ${ssh_opts[*]}" "$HERE/../provision.sh" "root@$ip:$POD_HARNESS/"
 rsync -a --exclude __pycache__ -e "ssh ${ssh_opts[*]}" "$HERE/" "root@$ip:$POD_HARNESS/gui-test/"
 on_pod "bash -s" >"$tmp/provision.log" 2>&1 <<EOF &
 set -euo pipefail
+want=\$(cat $POD_HARNESS/provision.sh $POD_HARNESS/gui-test/provision-gui.sh | sha256sum | cut -c1-16)
+[[ \$(cat /root/gui.provisioned 2>/dev/null) != "\$want" ]] || exit 0
 bash $POD_HARNESS/provision.sh
 bash $POD_HARNESS/gui-test/provision-gui.sh
 apt-get update
@@ -287,6 +325,7 @@ apt-get install -y --no-install-recommends iproute2 python3-numpy python3-scipy
 apt-get install -y --no-install-recommends python3-trimesh ||
     { apt-get install -y --no-install-recommends python3-pip && pip install --break-system-packages trimesh; }
 rm -rf /var/lib/apt/lists/*
+echo "\$want" >/root/gui.provisioned
 EOF
 provision_pid=$!
 for u in "${uploads[@]}"; do

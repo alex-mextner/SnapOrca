@@ -10,7 +10,12 @@
 #   slice-button:   centre of the first wide teal run in the top bar's right half ("Slice plate")
 # Exit status 1 when the element is not found.
 import subprocess
+import os
 import sys
+
+# Top of the main window's client area (fix-model-driver.sh): the bands below are measured on an
+# undecorated window and move down with a window manager title bar.
+DY = int(os.environ.get("DY", "0"))
 
 
 def teal(r, g, b):  # the #009688 accent of selected toggles and primary buttons, incl. hover and label tints
@@ -35,14 +40,14 @@ def runs(flags, min_len):
 
 
 def process_toggle():
-    x, y0, h = 140, 400, 400
+    x, y0, h = 140, 400 + DY, 400
     px = grab(x, y0, 1, h, "rgb")
     r = runs([teal(*px[i * 3:i * 3 + 3]) for i in range(h)], 12)
     return (x, y0 + (r[0][0] + r[0][1]) // 2) if r else None
 
 
 def arrange_tool():
-    x0, y0, w, h = 560, 76, 500, 40
+    x0, y0, w, h = 560, 76 + DY, 500, 40
     g = grab(x0, y0, w, h, "gray")
     r = runs([any(g[row * w + col] < 170 for row in range(h)) for col in range(w)], 20)
     return (x0 + (r[3][0] + r[3][1]) // 2, y0 + h // 2) if len(r) >= 4 else None
@@ -51,9 +56,9 @@ def arrange_tool():
 def slice_button():
     # Row 40 runs above the button label; the dropdown arrow left of it is a separate, narrower run.
     x0, w = 1000, 600
-    px = grab(x0, 40, w, 1, "rgb")
+    px = grab(x0, 40 + DY, w, 1, "rgb")
     r = runs([teal(*px[i * 3:i * 3 + 3]) for i in range(w)], 60)
-    return (x0 + (r[0][0] + r[0][1]) // 2, 48) if r else None
+    return (x0 + (r[0][0] + r[0][1]) // 2, 48 + DY) if r else None
 
 
 def main():

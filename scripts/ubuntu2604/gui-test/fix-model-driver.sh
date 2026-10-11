@@ -41,11 +41,12 @@ FILE_MENU=(41 14)
 SAVE_AS_ITEM=(85 142)  # File > "Save Project as..."
 LEGEND_COLLAPSE=(1139 95) # preview: collapse the line type legend
 GCODE_TOGGLE=(1171 95)    # preview: hide the G-code text window
+DY=0                      # top of the main window's client area, measured once it is maximized
 
 # locate NAME VAR: store "X Y" of a locate.py element in the array VAR, or fail.
 locate() {
     local pos
-    pos=$(python3 "$H/locate.py" "$1" 2>&1) || fail "$pos"
+    pos=$(DY="$DY" python3 "$H/locate.py" "$1" 2>&1) || fail "$pos"
     read -r -a "$2" <<<"$pos"
     log "located $1 at $pos"
 }
@@ -129,6 +130,17 @@ wmctrl -i -r "$MAIN" -b add,maximized_vert,maximized_horz
 sleep 3
 step loaded
 log "main window $MAIN '$(main_title)'"
+# The positions above are measured on an undecorated main window (the fork's). A window manager
+# title bar (Snapmaker's main asks for one) moves the client area down: shift them by its top.
+# xwininfo, not xdotool getwindowgeometry: the latter adds the frame offset once more.
+DY=$(xwininfo -id "$MAIN" | sed -nE 's/^ *Absolute upper-left Y: *(-?[0-9]+).*/\1/p')
+DY=${DY:-0}
+log "client area top: $DY"
+for v in RECT_FROM RECT_TO EMPTY_CANVAS OBJECT_LIST FILE_MENU SAVE_AS_ITEM LEGEND_COLLAPSE GCODE_TOGGLE; do
+    declare -n p=$v
+    p[1]=$((p[1] + DY))
+    unset -n p
+done
 
 # Before: object list (warning icons) and the info panel of the first object (error line).
 # The object list replaces the process settings when the toggle next to "Global" says "Objects";
@@ -204,7 +216,7 @@ click "${ARRANGE_TOOL[@]}"
 sleep 1.5
 shot 06-arrange-popup
 # The popup opens below the toolbar, left-aligned with the icon; "Arrange" is its first button.
-click $((ARRANGE_TOOL[0] + 32)) 326
+click $((ARRANGE_TOOL[0] + 32)) $((326 + DY))
 xdotool mousemove --sync "${EMPTY_CANVAS[@]}"
 wait_line_count 'ArrangeJob.* spend' "$arranged" 60 || fail "arrange did not run"
 step arrange_done
